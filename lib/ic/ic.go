@@ -17,16 +17,12 @@ package ic
 
 import (
 	"context"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"html/template"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -231,6 +227,7 @@ type Service struct {
 	hydraPublicURLProxy        *hydraproxy.Service
 	translators                sync.Map
 	encryption                 kms.Encryption
+	signer                     kms.Signer
 	logger                     *logging.Client
 	skipInformationReleasePage bool
 	useHydra                   bool
@@ -261,6 +258,8 @@ type Options struct {
 	Store storage.Store
 	// Encryption: the encryption use for storing tokens safely in database.
 	Encryption kms.Encryption
+	// Signer: the signer use for signing jwt.
+	Signer kms.Signer
 	// Logger: audit log logger
 	Logger *logging.Client
 	// SDLC: gRPC client to StackDriver Logging.
@@ -330,6 +329,7 @@ func New(r *mux.Router, params *Options) *Service {
 		hydraPublicURL:             params.HydraPublicURL,
 		hydraPublicURLProxy:        params.HydraPublicProxy,
 		encryption:                 params.Encryption,
+		signer:                     params.Signer,
 		logger:                     params.Logger,
 		skipInformationReleasePage: params.SkipInformationReleasePage,
 		useHydra:                   params.UseHydra,
@@ -441,7 +441,7 @@ func (sh *ServiceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 type loginPageArgs struct {
-	ProviderList   string
+	ProviderList   *pb.LoginPageProviders
 	AssetDir       string
 	ServiceTitle   string
 	LoginInfoTitle string
@@ -459,14 +459,8 @@ func (s *Service) renderLoginPage(cfg *pb.IcConfig, pathVars map[string]string, 
 		}
 	}
 
-	ma := jsonpb.Marshaler{}
-	json, err := ma.MarshalToString(list)
-	if err != nil {
-		return "", err
-	}
-
 	args := &loginPageArgs{
-		ProviderList:   json,
+		ProviderList:   list,
 		AssetDir:       assetPath,
 		ServiceTitle:   serviceTitle,
 		LoginInfoTitle: loginInfoTitle,
@@ -823,7 +817,7 @@ func linkedIdentityValue(sub, iss string) string {
 	return fmt.Sprintf("%s,%s", sub, iss)
 }
 
-func (s *Service) addLinkedIdentities(id *ga4gh.Identity, link *cpb.ConnectedAccount, privateKey *rsa.PrivateKey, cfg *pb.IcConfig) error {
+func (s *Service) addLinkedIdentities(ctx context.Context, id *ga4gh.Identity, link *cpb.ConnectedAccount, cfg *pb.IcConfig) error {
 	if len(id.Subject) == 0 {
 		return nil
 	}
@@ -868,7 +862,6 @@ func (s *Service) addLinkedIdentities(id *ga4gh.Identity, link *cpb.ConnectedAcc
 			IssuedAt:  now.Unix(),
 			ExpiresAt: exp,
 		},
-		Scope: "openid",
 		Assertion: ga4gh.Assertion{
 			Type:     ga4gh.LinkedIdentities,
 			Asserted: int64(link.Refreshed),
@@ -877,7 +870,7 @@ func (s *Service) addLinkedIdentities(id *ga4gh.Identity, link *cpb.ConnectedAcc
 		},
 	}
 
-	v, err := ga4gh.NewVisaFromData(d, s.visaIssuerJKU(), ga4gh.RS256, privateKey, keyID)
+	v, err := ga4gh.NewVisaFromData(ctx, d, s.visaIssuerJKU(), s.signer)
 	if err != nil {
 		return fmt.Errorf("ga4gh.NewVisaFromData(_) failed: %v", err)
 	}
@@ -896,14 +889,9 @@ func (s *Service) populateLinkVisas(ctx context.Context, id *ga4gh.Identity, lin
 		return err
 	}
 
-	priv, err := s.privateKeyFromSecrets(s.getVisaIssuerString(), secrets)
-	if err != nil {
-		return err
-	}
-
 	id.VisaJWTs = append(id.VisaJWTs, jwts...)
 
-	if err = s.addLinkedIdentities(id, link, priv, cfg); err != nil {
+	if err = s.addLinkedIdentities(ctx, id, link, cfg); err != nil {
 		return fmt.Errorf("add linked identities to visas failed: %v", err)
 	}
 
@@ -937,11 +925,11 @@ func hasScopes(want, got string, matchPrefix bool) bool {
 }
 
 func (s *Service) visaIssuerJKU() string {
-	return path.Join(s.getVisaIssuerString(), "/jwks")
+	return strings.TrimSuffix(s.getDomainURL(), "/") + "/visas/jwks"
 }
 
 func (s *Service) getVisaIssuerString() string {
-	return s.getDomainURL() + "/visas"
+	return strings.TrimSuffix(s.getDomainURL(), "/") + "/visas"
 }
 
 func (s *Service) getIssuerString() string {
@@ -1177,13 +1165,8 @@ func (s *Service) createIssuerTranslator(ctx context.Context, cfgIdp *cpb.Identi
 	}
 
 	selfIssuer := s.getIssuerString()
-	signingPrivateKey := ""
-	k, ok = secrets.TokenKeys[selfIssuer]
-	if ok {
-		signingPrivateKey = k.PrivateKey
-	}
 
-	return translator.CreateTranslator(ctx, iss, cfgIdp.TranslateUsing, cfgIdp.ClientId, publicKey, selfIssuer, signingPrivateKey)
+	return translator.CreateTranslator(ctx, iss, cfgIdp.TranslateUsing, cfgIdp.ClientId, publicKey, selfIssuer, s.signer)
 }
 
 func (s *Service) checkConfigIntegrity(cfg *pb.IcConfig) error {
@@ -1433,19 +1416,6 @@ func (s *Service) loadSecrets(tx storage.Tx) (*pb.IcSecrets, error) {
 		return nil, err
 	}
 	return secrets, nil
-}
-
-func (s *Service) privateKeyFromSecrets(iss string, secrets *pb.IcSecrets) (*rsa.PrivateKey, error) {
-	k, ok := secrets.TokenKeys[iss]
-	if !ok {
-		return nil, fmt.Errorf("token keys not found for passport issuer %q", iss)
-	}
-	block, _ := pem.Decode([]byte(k.PrivateKey))
-	priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parsing private key for issuer %q: %v", iss, err)
-	}
-	return priv, nil
 }
 
 func (s *Service) saveSecrets(secrets *pb.IcSecrets, desc, resType string, r *http.Request, id *ga4gh.Identity, tx storage.Tx) error {
